@@ -1,3 +1,9 @@
+# Install
+
+```sh
+go get github.com/UfukUstali/go-pty
+```
+
 # TODO
 
 - [ ] unix implementation
