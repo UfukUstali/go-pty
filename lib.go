@@ -32,29 +32,31 @@ type Pty interface {
 	// Get the size of the pty
 	GetSize() (PtySize, error)
 
-	// Get a readable handle (recommended to be used with 8192 byte buffer)
+	// Get a reader that reads from the pty.
+	// Recommended to be used with a bufio.Reader in it's own goroutine.
 	TakeReader() (io.Reader, error)
 
-	// Get a writable handle
+	// Get a writer that writes to the pty.
+	// Recommended to be used in it's own goroutine.
 	TakeWriter() (io.Writer, error)
 
 	// Spawn a command in the pty
 	SpawnCommand(cmd *exec.Cmd) (Child, error)
 
-	// Close the pty
-	// This should be called after the child process has exited
-	//
+	// Close the pty.
+	// This has to be called to free resources after Child.Wait and/or Child.Kill.
+	// Multiple calls to Close is fine.
 	Close() error
 }
 
 type Child interface {
-	// Non-blocking check if the child has completed.
-	// The first return value is the exit code but is only valid if there is no error
-	// If the error is `NotFinishedError` the process has not yet exited
+	// Non-blocking check if the child has exited.
+	// The first return value is the exit code but if there is no error.
+	// If the error is `ErrNotFinished` the process has not yet exited.
 	Exited() (uint32, error)
 
-	// Block until the child process completes
-	// The first return value is the exit code but is only valid if there is no error
+	// Block until the child process exits.
+	// The first return value is the exit code but is only valid if there is no error.
 	Wait() (uint32, error)
 
 	// Terminate the child process

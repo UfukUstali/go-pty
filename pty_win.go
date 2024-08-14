@@ -4,13 +4,18 @@
 package lib
 
 import (
+	"bufio"
 	"io"
+	"log"
+	"os"
 	"os/exec"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+var logger = log.New(os.Stdout, "go-pty", log.Lmsgprefix|log.Lshortfile)
 
 const (
 	PSEUDOCONSOLE_INHERIT_CURSOR   = 0x1
@@ -24,6 +29,7 @@ type windowsReader struct {
 
 func (r *windowsReader) Read(p []byte) (int, error) {
 	var n uint32
+	// log.Info("Reading from pipe")
 	switch err := windows.ReadFile(r.read, p, &n, nil); err {
 	case windows.ERROR_BROKEN_PIPE:
 		return 0, io.EOF
@@ -34,6 +40,7 @@ func (r *windowsReader) Read(p []byte) (int, error) {
 	case nil:
 		return int(n), nil
 	default:
+		logger.Println(err)
 		return 0, err
 	}
 }
@@ -45,6 +52,7 @@ type windowsWriter struct {
 func (w *windowsWriter) Write(p []byte) (int, error) {
 	var n uint32
 	if err := windows.WriteFile(w.write, p, &n, nil); err != nil {
+		logger.Println(err)
 		return 0, err
 	}
 	return int(n), nil
@@ -52,13 +60,12 @@ func (w *windowsWriter) Write(p []byte) (int, error) {
 
 type windowsChild struct {
 	Proc windows.Handle
-
-	ClosePty func() error
 }
 
 func (c *windowsChild) Exited() (uint32, error) {
 	var status uint32
 	if err := windows.GetExitCodeProcess(c.Proc, &status); err != nil {
+		logger.Println(err)
 		return 0, err
 	}
 
@@ -74,13 +81,12 @@ func (c *windowsChild) Wait() (uint32, error) {
 		return 0, ErrAlreadyClosed
 	}
 	if _, err := windows.WaitForSingleObject(c.Proc, windows.INFINITE); err != nil {
+		logger.Println(err)
 		return 0, err
 	}
-	if err := c.ClosePty(); err != nil {
-		return 0, err
-	}
+	code, err := c.Exited()
 	c.Proc = windows.InvalidHandle
-	return c.Exited()
+	return code, err
 }
 
 func (c *windowsChild) Kill() error {
@@ -88,20 +94,20 @@ func (c *windowsChild) Kill() error {
 		return ErrAlreadyClosed
 	}
 	if err := windows.TerminateProcess(c.Proc, 1); err != nil {
+		logger.Println(err)
 		return err
 	}
-	if err := c.ClosePty(); err != nil {
-		return err
-	}
-	c.Proc = windows.InvalidHandle
 	return nil
 }
 
 type windowsPty struct {
-	PCon     windows.Handle
-	PtySize  PtySize
-	Readable *windowsReader
-	Writable *windowsWriter
+	PCon        windows.Handle
+	PtySize     PtySize
+	Readable    *windowsReader
+	readHandle  windows.Handle
+	Writable    *windowsWriter
+	writeHandle windows.Handle
+	closed      bool
 }
 
 func (p *windowsPty) Resize(size PtySize) error {
@@ -109,6 +115,7 @@ func (p *windowsPty) Resize(size PtySize) error {
 		p.PCon,
 		windows.Coord{X: int16(size.Cols), Y: int16(size.Rows)},
 	); err != nil {
+		logger.Println(err)
 		return err
 	}
 
@@ -150,15 +157,17 @@ func (p *windowsPty) SpawnCommand(cmd *exec.Cmd) (Child, error) {
 
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
+		logger.Println(err)
 		return nil, err
 	}
 	defer attrs.Delete()
 
 	if err := attrs.Update(
 		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-		unsafe.Pointer(&p.PCon),
+		unsafe.Pointer(p.PCon),
 		unsafe.Sizeof(p.PCon),
 	); err != nil {
+		logger.Println(err)
 		return nil, err
 	}
 
@@ -166,35 +175,38 @@ func (p *windowsPty) SpawnCommand(cmd *exec.Cmd) (Child, error) {
 
 	exe, err := syscall.UTF16PtrFromString(cmd.Path)
 	if err != nil {
+		logger.Println(err)
 		return nil, err
 	}
 
-	var cmd_str string
-	cmd_str = cmd.Path + " "
+	cmd_str := cmd.Path
 	for _, arg := range cmd.Args[1:] {
-		cmd_str += arg + " "
+		cmd_str += " " + arg
 	}
 
 	cmd_line, err := syscall.UTF16PtrFromString(cmd_str)
 	if err != nil {
+		logger.Println(err)
 		return nil, err
 	}
 
-	var env string
-	var env_block *uint16
+	env := []uint16{}
 	for _, arg := range cmd.Env {
-		env += arg + "\x00"
+		uint16_arg, err := syscall.UTF16FromString(arg)
+		if err != nil {
+			logger.Println(err)
+			return nil, err
+		}
+		env = append(env, uint16_arg...)
 	}
-	env += "\x00"
-	env_block, err = syscall.UTF16PtrFromString(env)
-	if err != nil {
-		return nil, err
-	}
+	env = append(env, 0)
+	env_block := &env[0]
 
-	var cwd *uint16
+	var cwd *uint16 = nil
 	if cmd.Dir != "" {
 		cwd, err = syscall.UTF16PtrFromString(cmd.Dir)
 		if err != nil {
+			logger.Println(err)
 			return nil, err
 		}
 	}
@@ -213,39 +225,91 @@ func (p *windowsPty) SpawnCommand(cmd *exec.Cmd) (Child, error) {
 		&si.StartupInfo,
 		&pi,
 	); err != nil {
+		logger.Println(err)
 		return nil, err
 	}
-	defer windows.CloseHandle(pi.Thread)
+	err = windows.CloseHandle(pi.Thread)
+	if err != nil {
+		logger.Println(err)
+		return nil, err
+	}
 
 	return &windowsChild{
 		pi.Process,
-		p.Close,
 	}, nil
 }
 
 func (p *windowsPty) Close() error {
-	windows.CloseHandle(p.Readable.read)
-	windows.CloseHandle(p.Writable.write)
+	if p.closed {
+		return ErrAlreadyClosed
+	}
 	windows.ClosePseudoConsole(p.PCon)
+	buffReader := bufio.NewReader(&windowsReader{p.readHandle})
+	for {
+		_, err := buffReader.Discard(4096)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			logger.Println(err)
+			return err
+		}
+	}
+	if err := windows.CloseHandle(p.readHandle); err != nil {
+		logger.Println(err)
+		return err
+	}
+	if err := windows.CloseHandle(p.writeHandle); err != nil {
+		logger.Println(err)
+		return err
+	}
+	p.closed = true
 	return nil
+}
+
+type Pipe struct {
+	Read  windows.Handle
+	Write windows.Handle
+}
+
+func createPipe() (*Pipe, error) {
+	sa := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
+		SecurityDescriptor: nil,
+		InheritHandle:      0,
+	}
+	var (
+		read  windows.Handle = windows.InvalidHandle
+		write windows.Handle = windows.InvalidHandle
+	)
+
+	if err := windows.CreatePipe(&read, &write, &sa, 0); err != nil {
+		logger.Println(err)
+		return nil, err
+	}
+
+	return &Pipe{
+		Read:  read,
+		Write: write,
+	}, nil
 }
 
 func NewPty(size PtySize) (Pty, error) {
 	stdin, err := createPipe()
-
 	if err != nil {
+		logger.Println(err)
 		return nil, err
 	}
 
 	stdout, err := createPipe()
-
 	if err != nil {
 		windows.CloseHandle(stdin.Write)
 		windows.CloseHandle(stdin.Read)
+		logger.Println(err)
 		return nil, err
 	}
 
-	var PCon windows.Handle
+	PCon := windows.InvalidHandle
 
 	coord := windows.Coord{
 		X: int16(size.Cols),
@@ -264,6 +328,7 @@ func NewPty(size PtySize) (Pty, error) {
 		windows.CloseHandle(stdin.Read)
 		windows.CloseHandle(stdout.Write)
 		windows.CloseHandle(stdout.Read)
+		logger.Println(err)
 		return nil, err
 	}
 	windows.CloseHandle(stdin.Read)
@@ -273,32 +338,9 @@ func NewPty(size PtySize) (Pty, error) {
 		PCon,
 		size,
 		&windowsReader{stdout.Read},
+		stdout.Read,
 		&windowsWriter{stdin.Write},
-	}, nil
-}
-
-type Pipe struct {
-	Read  windows.Handle
-	Write windows.Handle
-}
-
-func createPipe() (*Pipe, error) {
-	sa := windows.SecurityAttributes{
-		Length:             uint32(unsafe.Sizeof(syscall.SecurityAttributes{})),
-		SecurityDescriptor: &windows.SECURITY_DESCRIPTOR{},
-		InheritHandle:      0,
-	}
-	var (
-		read  windows.Handle = windows.InvalidHandle
-		write windows.Handle = windows.InvalidHandle
-	)
-
-	if err := windows.CreatePipe(&read, &write, &sa, 0); err != nil {
-		return nil, err
-	}
-
-	return &Pipe{
-		Read:  read,
-		Write: write,
+		stdin.Write,
+		false,
 	}, nil
 }
