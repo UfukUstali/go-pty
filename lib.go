@@ -44,6 +44,7 @@ type Pty interface {
 	SpawnCommand(cmd *exec.Cmd) (Child, error)
 
 	// Close the pty.
+	// Make sure to stop reading and writing before calling this.
 	// This has to be called to free resources after Child.Wait and/or Child.Kill.
 	// Multiple calls to Close is fine.
 	Close() error

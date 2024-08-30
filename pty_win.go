@@ -4,7 +4,6 @@
 package lib
 
 import (
-	"bufio"
 	"io"
 	"log"
 	"os"
@@ -243,18 +242,27 @@ func (p *windowsPty) Close() error {
 	if p.closed {
 		return ErrAlreadyClosed
 	}
-	windows.ClosePseudoConsole(p.PCon)
-	buffReader := bufio.NewReader(&windowsReader{p.readHandle})
-	for {
-		_, err := buffReader.Discard(4096)
-		if err != nil {
-			if err == io.EOF {
-				break
+	go func() {
+		// https://learn.microsoft.com/en-us/windows/console/closepseudoconsole#remarks
+		reader := &windowsReader{p.readHandle}
+		buffer := make([]byte, 4096)
+		for {
+			n, err := reader.Read(buffer)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				logger.Println(err)
+				return
 			}
-			logger.Println(err)
-			return err
+			// respond to cursor position requests otherwise the process will hang don't know why
+			if n == 4 && string(buffer[:n]) == "\x1b[6n" {
+				writer := &windowsWriter{p.writeHandle}
+				writer.Write([]byte("\x1b[24;80R"))
+			}
 		}
-	}
+	}()
+	windows.ClosePseudoConsole(p.PCon)
 	if err := windows.CloseHandle(p.readHandle); err != nil {
 		logger.Println(err)
 		return err
